@@ -59,6 +59,18 @@ def free_port():
         return s.getsockname()[1]
 
 
+def wait_for_port(port):
+    """bserve is up once it accepts. (A bare probe connection sends no preface;
+    bserve just sees EOF.) A fixed sleep is not enough on a cold start."""
+    for _ in range(100):
+        try:
+            socket.create_connection(("127.0.0.1", port)).close()
+            return
+        except OSError:
+            time.sleep(0.1)
+    raise RuntimeError("bserve did not start on port %d" % port)
+
+
 class Peer:
     """A raw socket speaking to bserve, with a hand-written frame reader."""
 
@@ -147,13 +159,7 @@ class ServerTest(unittest.TestCase):
         cls.port = free_port()
         cls.proc = subprocess.Popen([BSERVE, "--idle", "1.5", cls.root, str(cls.port)],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for _ in range(50):
-            try:
-                socket.create_connection(("127.0.0.1", cls.port)).close()
-                return
-            except OSError:
-                time.sleep(0.1)
-        raise RuntimeError("bserve did not start")
+        wait_for_port(cls.port)
 
     @classmethod
     def tearDownClass(cls):
@@ -447,7 +453,7 @@ class EndToEndTest(unittest.TestCase):
         cls.www = os.path.join(HERE, "www")
         cls.proc = subprocess.Popen([BSERVE, "--grease", cls.www, str(cls.port)],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.5)
+        wait_for_port(cls.port)
 
     @classmethod
     def tearDownClass(cls):
