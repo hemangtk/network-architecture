@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""
+bserve -- a BHP/1 file server.
+
+Author : Hemang (Roll No. 24bcs10209)
+
+    $ ./bserve ./www 9000
+    $ ./bserve -v --grease ./www 9000
+
+accept a TCP connection, check the preface, then loop:
+    read one request (HEADERS [+ DATA ... END_STREAM])
+    map :path to a file under the root
+    reply HEADERS (:status, content-type, content-length, ...) + DATA frames
+    404 if it is not there, 400 if the frame is malformed, 405 for non-GET/HEAD
+    and keep the connection open
+
+Options
+    -v        log every frame (header summary + hexdump) to stderr
+    --grease  send an unknown frame type before each response, to prove that
+              clients skip what they do not understand
+    --idle N  idle timeout in seconds (default 30)
+"""
+
+import email.utils
+import mimetypes
+import os
+import socket
+import sys
+import threading
+import time
+from urllib.parse import unquote
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import bproto as bp  # noqa: E402
+
+SERVER_NAME = "bserve/1 (24bcs10209)"
+MAX_HEADER_BLOCK = 65536        # a bigger HEADERS frame is skipped and 400'd
+GREASE_TYPE = 0xFA
+
+_log_lock = threading.Lock()
+
+
+def log(*parts):
+    with _log_lock:
+        print(*parts, file=sys.stderr, flush=True)
+
+
+class Conn:
+    def __init__(self, sock, addr, root, verbose, grease, idle):
+        self.sock = sock
+        self.addr = "%s:%d" % addr
+        self.root = root
+        self.verbose = verbose
+        self.grease = grease
+        self.reader = bp.FrameReader(sock)
+        sock.settimeout(idle)
+        self.idle = idle
+
+    # -- output -------------------------------------------------------------
+
+    def send_frame(self, ftype, flags, stream, payload=b""):
+        raw = bp.frame(ftype, flags, stream, payload)
+        if self.verbose:
+            log("[%s] >> %s\n%s" % (self.addr,
+                                    bp.describe(ftype, flags, stream, len(payload)),
+                                    bp.hexdump(raw, "   ")))
+        self.sock.sendall(raw)
+
+    def respond(self, stream, status, body=b"", ctype="text/plain; charset=utf-8",
+                head_only=False, extra=()):
+        if self.grease:
+            self.send_frame(GREASE_TYPE, 0, stream, b"skip me, I am from v2")
+        fields = [(":status", str(status)), ("content-type", ctype),
+                  ("content-length", str(len(body))), ("server", SERVER_NAME)]
+        fields.extend(extra)
+        block = bp.encode_headers(fields)
+        if head_only or not body:
+            self.send_frame(bp.HEADERS, bp.END_STREAM, stream, block)
+            return
+        self.send_frame(bp.HEADERS, 0, stream, block)
+        for off in range(0, len(body), bp.DATA_CHUNK):
+            piece = body[off:off + bp.DATA_CHUNK]
+            last = off + bp.DATA_CHUNK >= len(body)
+            self.send_frame(bp.DATA, bp.END_STREAM if last else 0, stream, piece)
+
+    def error(self, stream, status, message):
+        self.respond(stream, status, (message + "\n").encode())
+        log("[%s] stream %d -> %d %s" % (self.addr, stream, status, message))
+
+    # -- input --------------------------------------------------------------
+
+    def next_frame(self):
+        length, ftype, flags, stream, raw = self.reader.read_header()
+        if ftype in (bp.DATA, bp.HEADERS, bp.GOAWAY) and length <= MAX_HEADER_BLOCK:
+            payload = self.reader.read_exact(length)
+        elif ftype == bp.HEADERS:
+            self.reader.skip(length)
+            payload = None               # too big: framing intact, content lost
+        else:
+            self.reader.skip(length)     # unknown type or big DATA: discard
+            payload = b""
+        if self.verbose:
+            shown = raw + (payload or b"")[:256]
+            log("[%s] << %s\n%s" % (self.addr, bp.describe(ftype, flags, stream, length),
+                                    bp.hexdump(shown, "   ")))
+        return length, ftype, flags, stream, payload
+
+    def drain_body(self, stream):
+        """Request carried a body we do not need; discard up to END_STREAM."""
+        while True:
+            _, ftype, flags, fstream, _ = self.next_frame()
+            if ftype == bp.HEADERS:
+                raise bp.ProtocolError("new HEADERS before END_STREAM (v1 does not interleave)")
+            if ftype == bp.DATA and fstream == stream and flags & bp.END_STREAM:
+                return
+
+    # -- request handling ---------------------------------------------------
+
+    def handle(self, stream, flags, payload):
+        if payload is None:
+            return self.error(stream, 400, "header block larger than %d octets"
+                              % MAX_HEADER_BLOCK)
+        if not flags & bp.END_STREAM:
+            self.drain_body(stream)
+        if stream == 0:
+            return self.error(0, 400, "HEADERS must not use stream 0")
+        try:
+            fields = bp.decode_headers(payload)
+        except bp.ProtocolError as err:
+            return self.error(stream, 400, "malformed header block: %s" % err)
+
+        methods = [v for k, v in fields if k == ":method"]
+        paths = [v for k, v in fields if k == ":path"]
+        if len(methods) != 1 or len(paths) != 1:
+            return self.error(stream, 400, "need exactly one :method and one :path")
+        method, path = methods[0], paths[0]
+        if not path.startswith("/"):
+            return self.error(stream, 400, ":path must start with /")
+        if method not in ("GET", "HEAD"):
+            return self.error(stream, 405, "method %s not allowed" % method)
+
+        target = self.resolve(path)
+        if target is None:
+            status, body = 404, ("not found: %s\n" % path).encode()
+            self.respond(stream, status, body, head_only=(method == "HEAD"))
+        else:
+            with open(target, "rb") as f:
+                body = f.read()
+            ctype = mimetypes.guess_type(target)[0] or "application/octet-stream"
+            if ctype.startswith("text/"):
+                ctype += "; charset=utf-8"
+            mtime = email.utils.formatdate(os.path.getmtime(target), usegmt=True)
+            status = 200
+            self.respond(stream, 200, body, ctype, head_only=(method == "HEAD"),
+                         extra=[("last-modified", mtime)])
+        log("[%s] stream %d %s %s -> %d (%d bytes)"
+            % (self.addr, stream, method, path, status, len(body)))
+
+    def resolve(self, path):
+        """:path -> absolute file path inside root, or None."""
+        rel = unquote(path.split("?", 1)[0])
+        if "\x00" in rel:
+            return None
+        full = os.path.realpath(os.path.join(self.root, rel.lstrip("/")))
+        if full != self.root and not full.startswith(self.root + os.sep):
+            return None                  # ../ escape: pretend it is not there
+        if os.path.isdir(full):
+            full = os.path.join(full, "index.html")
+        return full if os.path.isfile(full) else None
+
+    # -- connection loop ----------------------------------------------------
+
+    def serve(self):
+        served = 0
+        try:
+            preface = self.reader.read_exact(len(bp.PREFACE))
+            if preface != bp.PREFACE:
+                self.error(0, 400, "bad connection preface; expected 42 48 50 01")
+                self.send_frame(bp.GOAWAY, 0, 0, b"bad preface")
+                log("[%s] bad preface %s -> 400, closing" % (self.addr, preface.hex()))
+                return
+            while True:
+                _, ftype, flags, stream, payload = self.next_frame()
+                if ftype == bp.HEADERS:
+                    self.handle(stream, flags, payload)
+                    served += 1
+                elif ftype == bp.GOAWAY:
+                    log("[%s] client GOAWAY after %d requests" % (self.addr, served))
+                    return
+                # DATA outside a request and unknown frame types: already skipped
+        except socket.timeout:
+            try:
+                self.send_frame(bp.GOAWAY, 0, 0, b"idle timeout")
+            except OSError:
+                pass
+            log("[%s] idle %ds, GOAWAY after %d requests" % (self.addr, self.idle, served))
+        except EOFError:
+            log("[%s] client closed after %d requests" % (self.addr, served))
+        except bp.ProtocolError as err:
+            log("[%s] protocol error: %s" % (self.addr, err))
+        except (ConnectionResetError, BrokenPipeError):
+            log("[%s] connection reset" % self.addr)
+        finally:
+            self.sock.close()
+
+
+def usage():
+    sys.exit("usage: bserve [-v] [--grease] [--idle SECONDS] ROOT PORT")
+
+
+def main():
+    args = sys.argv[1:]
+    verbose = grease = False
+    idle = 30
+    pos = []
+    while args:
+        a = args.pop(0)
+        if a == "-v":
+            verbose = True
+        elif a == "--grease":
+            grease = True
+        elif a == "--idle" and args:
+            idle = float(args.pop(0))
+        elif a.startswith("-"):
+            usage()
+        else:
+            pos.append(a)
+    if len(pos) != 2:
+        usage()
+    root = os.path.realpath(pos[0])
+    port = int(pos[1])
+    if not os.path.isdir(root):
+        sys.exit("bserve: %s is not a directory" % pos[0])
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", port))
+    srv.listen(64)
+    log("bserve (24bcs10209): serving %s on :%d (BHP/1, idle %ss)" % (root, port, idle))
+    try:
+        while True:
+            sock, addr = srv.accept()
+            log("[%s:%d] accepted" % addr)
+            conn = Conn(sock, addr, root, verbose, grease, idle)
+            threading.Thread(target=conn.serve, daemon=True).start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.close()
+
+
+if __name__ == "__main__":
+    main()

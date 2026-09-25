@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""
+bcurl -- a BHP/1 client.
+
+Author : Hemang (Roll No. 24bcs10209)
+
+    $ ./bcurl -v localhost:9000/index.html
+    $ ./bcurl localhost:9000/a.txt localhost:9000/b.txt     # one connection
+
+build the binary request frame, read the response, body to stdout,
+-v hexdumps every frame (to stderr), exit non-zero on 4xx / 5xx,
+and never open a second connection: several URLs share one socket.
+
+Options
+    -v          hexdump every frame sent and received
+    -vv         ... and annotate every field of every frame
+    -I          HEAD instead of GET (print response headers only)
+    -X METHOD   any other method (the server will answer 405)
+    --pipeline  send every request before reading any response
+    --grease    send an unknown frame type first (server must skip it)
+
+Exit status
+    0  every response was 1xx-3xx
+    4  at least one 4xx (and no 5xx)
+    5  at least one 5xx
+    3  connection or protocol error
+    2  usage error
+"""
+
+import os
+import socket
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import bproto as bp  # noqa: E402
+
+USER_AGENT = "bcurl/1 (24bcs10209)"
+
+
+def err(msg):
+    print("bcurl: " + msg, file=sys.stderr, flush=True)
+
+
+def parse_url(url):
+    """'localhost:9000/index.html' or 'bhp://host:port/path' -> host, port, path"""
+    if "://" in url:
+        scheme, url = url.split("://", 1)
+        if scheme != "bhp":
+            raise ValueError("only bhp:// URLs (or none) are supported")
+    hostport, slash, path = url.partition("/")
+    host, _, port = hostport.rpartition(":")
+    if not host or not port.isdigit():
+        raise ValueError("expected HOST:PORT/PATH, got %r" % url)
+    return host, int(port), "/" + path
+
+
+class Client:
+    def __init__(self, host, port, verbosity):
+        self.host = host
+        self.port = port
+        self.v = verbosity
+        self.sock = socket.create_connection((host, port), timeout=30)
+        self.reader = bp.FrameReader(self.sock)
+        self.next_stream = 1
+        self.show("connected to %s:%d (one TCP connection for everything)"
+                  % (host, port))
+
+    def show(self, text):
+        if self.v:
+            print("* " + text, file=sys.stderr, flush=True)
+
+    def dump(self, arrow, raw):
+        if not self.v:
+            return
+        length, ftype, flags, stream = bp.unpack_frame_header(raw[:bp.HEADER_LEN])
+        print("%s %s" % (arrow, bp.describe(ftype, flags, stream, length)),
+              file=sys.stderr)
+        print(bp.hexdump(raw, "%s   " % arrow), file=sys.stderr)
+        if self.v >= 2:
+            print(bp.format_annotation(bp.annotate(raw), "%s   " % arrow),
+                  file=sys.stderr)
+        sys.stderr.flush()
+
+    def send_raw(self, raw, arrow=">"):
+        self.dump(arrow, raw)
+        self.sock.sendall(raw)
+
+    def preface(self):
+        if self.v:
+            print("> PREFACE\n" + bp.hexdump(bp.PREFACE, ">   "), file=sys.stderr)
+        self.sock.sendall(bp.PREFACE)
+
+    def grease(self):
+        self.send_raw(bp.frame(0xFA, 0, 0, b"v2 would put something here"))
+
+    def send_request(self, method, path):
+        stream = self.next_stream
+        self.next_stream += 1
+        block = bp.encode_headers([
+            (":method", method), (":path", path), ("host", self.host),
+            ("user-agent", USER_AGENT), ("accept", "*/*"),
+        ])
+        self.send_raw(bp.frame(bp.HEADERS, bp.END_STREAM, stream, block))
+        return stream
+
+    def read_frame(self):
+        length, ftype, flags, stream, raw = self.reader.read_header()
+        if ftype not in (bp.DATA, bp.HEADERS, bp.GOAWAY):
+            self.reader.skip(length)          # the rule you may not skip
+            self.show("unknown frame type 0x%02x (%d octets) skipped"
+                      % (ftype, length))
+            if self.v:
+                print("< " + bp.describe(ftype, flags, stream, length) + "\n"
+                      + bp.hexdump(raw, "<   "), file=sys.stderr)
+            return None
+        payload = self.reader.read_exact(length)
+        self.dump("<", raw + payload)
+        return ftype, flags, stream, payload
+
+    def read_response(self, stream):
+        """-> (status, fields, body)"""
+        fields = None
+        body = bytearray()
+        while True:
+            fr = self.read_frame()
+            if fr is None:
+                continue
+            ftype, flags, fstream, payload = fr
+            if ftype == bp.GOAWAY:
+                raise bp.ProtocolError("server sent GOAWAY: %s"
+                                       % payload.decode("utf-8", "replace"))
+            if fstream != stream:
+                if fstream == 0 and ftype == bp.HEADERS:
+                    # connection-level error response (e.g. bad preface)
+                    stream = 0
+                else:
+                    raise bp.ProtocolError("frame for stream %d while waiting "
+                                           "for stream %d" % (fstream, stream))
+            if ftype == bp.HEADERS:
+                if fields is not None:
+                    raise bp.ProtocolError("second HEADERS on stream %d" % stream)
+                fields = bp.decode_headers(payload)
+            elif fields is None:
+                raise bp.ProtocolError("DATA before HEADERS on stream %d" % stream)
+            else:
+                body += payload
+            if flags & bp.END_STREAM:
+                break
+        status = next((v for k, v in fields if k == ":status"), None)
+        if status is None or not status.isdigit():
+            raise bp.ProtocolError("response without a valid :status")
+        return int(status), fields, bytes(body)
+
+
+def usage(msg=None):
+    if msg:
+        err(msg)
+    print("usage: bcurl [-v|-vv] [-I] [-X METHOD] [--pipeline] [--grease] "
+          "HOST:PORT/PATH [HOST:PORT/PATH ...]", file=sys.stderr)
+    sys.exit(2)
+
+
+def main():
+    args = sys.argv[1:]
+    verbosity, method, pipeline, grease = 0, "GET", False, False
+    urls = []
+    while args:
+        a = args.pop(0)
+        if a == "-v":
+            verbosity = max(verbosity, 1)
+        elif a == "-vv":
+            verbosity = 2
+        elif a == "-I":
+            method = "HEAD"
+        elif a == "-X" and args:
+            method = args.pop(0).upper()
+        elif a == "--pipeline":
+            pipeline = True
+        elif a == "--grease":
+            grease = True
+        elif a in ("-h", "--help"):
+            usage()
+        elif a.startswith("-"):
+            usage("unknown option " + a)
+        else:
+            urls.append(a)
+    if not urls:
+        usage("no URL given")
+
+    try:
+        targets = [parse_url(u) for u in urls]
+    except ValueError as e:
+        usage(str(e))
+    if len({(h, p) for h, p, _ in targets}) != 1:
+        usage("all URLs must share one host:port -- bcurl never opens a "
+              "second connection")
+
+    host, port, _ = targets[0]
+    worst = 0
+    try:
+        c = Client(host, port, verbosity)
+        c.preface()
+        if grease:
+            c.grease()
+        if pipeline:
+            streams = [c.send_request(method, path) for _, _, path in targets]
+        else:
+            streams = [None] * len(targets)
+        for i, (_, _, path) in enumerate(targets):
+            stream = streams[i] or c.send_request(method, path)
+            status, fields, body = c.read_response(stream)
+            c.show("stream %d: %s %s -> %d" % (stream, method, path, status))
+            if method == "HEAD":
+                sys.stdout.write(":status: %d\n" % status)
+                for k, v in fields:
+                    if k != ":status":
+                        sys.stdout.write("%s: %s\n" % (k, v))
+                sys.stdout.flush()
+            else:
+                declared = next((v for k, v in fields if k == "content-length"), None)
+                if declared is not None and int(declared) != len(body):
+                    raise bp.ProtocolError("content-length %s but got %d octets"
+                                           % (declared, len(body)))
+                sys.stdout.buffer.write(body)
+                sys.stdout.buffer.flush()
+            if status >= 400:
+                err("%s -> %d" % (path, status))
+            worst = max(worst, status // 100)
+        c.send_raw(bp.frame(bp.GOAWAY, 0, 0, b"done"))
+        c.sock.close()
+    except (OSError, EOFError) as e:
+        err("connection error: %s" % e)
+        sys.exit(3)
+    except bp.ProtocolError as e:
+        err("protocol error: %s" % e)
+        sys.exit(3)
+    sys.exit({4: 4, 5: 5}.get(worst, 0))
+
+
+if __name__ == "__main__":
+    main()
