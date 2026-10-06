@@ -2,100 +2,143 @@
 
 *Hemang, Roll No. 24bcs10209*
 
-A binary framing of HTTP semantics, delivered as a spec, a server, a client,
-and an annotated hexdump.
+BHP/1 carries HTTP semantics in fixed-size binary frames. It comes with a
+two-page spec, a server (`bserve`), a client (`bcurl`), and an annotated
+hexdump of real wire traffic. It also includes independent implementations in
+C and JavaScript (Node.js), written from the spec alone, to show that the spec
+is the protocol and not just one program's behaviour.
+
+## Quick check (one command)
+
+```
+./demo.sh                       # every line of the brief, PASS/FAIL, against a live server
+python3 -m unittest test_bhp    # 109 end-to-end tests
+```
+
+Output of `./demo.sh` (abridged; the full run is under
+[Captured output](#captured-output)):
+
+```
+Track 1 -- the server:  ./bserve ./www 9000
+  PASS  accept a TCP connection, read one binary request frame, reply 200   [1 200 open]
+  PASS  map the path to a file under a root; reply status, headers, bytes (48 KB byte-exact)
+  PASS  404 if it is not there -- and the connection stays open   [1 404 2 200 open]
+  PASS  400 if the frame is malformed -- and the connection stays open   [1 400 2 200 open]
+  ...
+17 passed, 0 failed
+```
 
 ## What is handed in
 
-| # | Deliverable | File |
+| # | The brief asks for | File |
 |---|---|---|
-| 1 | **The spec.** About two pages, meant to be enough for a stranger to implement from. It covers the frame layout, why each field has the width it does, why HTTP/2 chose 24/8/8/31, the header block format, and the rule to skip unknown frame types. | [`SPEC.md`](SPEC.md) |
-| 2 | **The program.** Track 1 is the server, track 2 is the client. | [`bserve`](bserve), [`bcurl`](bcurl), [`bproto.py`](bproto.py) |
-| 3 | **An annotated hexdump** of one complete request and response, captured from a real run. | [`HEXDUMP.md`](HEXDUMP.md), raw output in [`hexdump-capture.txt`](hexdump-capture.txt) |
-| + | **An independent client in C**, written only from `SPEC.md`, to show this is a protocol and not just one implementation. | [`interop/bget.c`](interop/bget.c) |
-| + | **Tests:** 27 end-to-end tests. | [`test_bhp.py`](test_bhp.py) |
+| 1 | **The spec.** Two pages, enough for a stranger. | [`SPEC.md`](SPEC.md), with [`SPEC.pdf`](SPEC.pdf) rendered at A4, 10.5 pt: **exactly 2 pages**. |
+| | The defence of the widths, and the answer to "HTTP/2 chose 24/8/8/31. Why?" | [`DESIGN.md`](DESIGN.md) |
+| 2 | **Your program.** Track 1 is the server, track 2 is the client. | [`bserve`](bserve), [`bcurl`](bcurl), and the shared [`bproto.py`](bproto.py) |
+| 3 | **An annotated hexdump** of one complete request and response. | [`HEXDUMP.md`](HEXDUMP.md): every octet annotated by hand. The bytes were captured on the wire by [`tools/wiretap.py`](tools/wiretap.py) and are in [`captures/`](captures/). |
+| + | **Pairs:** "a client that only works against your own server is an implementation, not a protocol". | Independent [`interop/bget.c`](interop/bget.c) (a C client) and [`interop/bserve.js`](interop/bserve.js) (a Node server), each written from the spec. [`interop/matrix.sh`](interop/matrix.sh) runs every client against every server. [`interop/stranger_client.py`](interop/stranger_client.py) was written blind from `SPEC.md`. |
 
-Everything is Python 3 standard library, plus one C file. No frameworks.
+## Requirement checklist
 
-## The protocol in one screen
+Each row of the brief, where it is implemented, and how it is proven.
 
-```
-preface (client, once):   42 48 50 01                       "BHP" v1
+| Brief | Implemented in | Proven by |
+|---|---|---|
+| `./bserve ./www 9000` | `bserve` `main()` takes ROOT and PORT | `demo.sh` |
+| Accept a TCP connection | Thread per connection; the preface is checked first | `test_spec_worked_example` |
+| Read one binary request frame | One HEADERS frame per request (8-octet header + header block) | `test_spec_worked_example` sends SPEC §6 byte for byte |
+| Map the path to a file under a root | `Conn.resolve`: drop the query, percent-decode, `realpath`, root check, directory → `index.html` | `test_path_traversal_is_404`, `test_symlink_out_of_root_is_404`, `test_query_is_ignored_and_percent_decoding_applies` |
+| Reply with status, headers, the bytes | HEADERS (`:status`, `content-type`, `content-length`, `server`, `last-modified`), then DATA frames of at most 16 KiB, streamed from disk | `test_body_split_into_16k_data_frames` (100 KB arrives as 7 frames), `test_bcurl_fetches_files_byte_exact` |
+| 404 if it is not there | Yes. It also sends 403 for an unreadable file, 405 for other methods, and 500 for I/O errors. | `test_keeps_connection_open_across_statuses`, `test_unreadable_file_is_403_and_connection_survives` |
+| 400 if the frame is malformed | Checked in exactly the order of SPEC §4's table, so 400 comes before 405. Covers: a malformed header block, a bad or repeated `content-length` or one that does not match the body, missing or repeated `:method`/`:path`, bad `:path`, HEADERS on stream 0, a stream ID that does not increase, an oversized header block, or a request cut short by new HEADERS or by DATA for another stream. Error responses to HEAD carry no DATA. | `test_malformed_header_block_is_400_and_connection_survives` (8 cases), `test_oversized_header_block_is_400_and_connection_survives`, `test_new_headers_before_end_stream_gets_400_then_is_served`, `test_data_for_another_stream_mid_request_is_400`, `test_stream_ids_must_increase`, `test_head_error_responses_carry_no_data`, `test_request_content_length_rules`, `test_400_row_is_checked_before_405`, `test_aborted_request_still_uses_up_its_stream_id` |
+| And keep the connection open | Errors never close the connection, because Length keeps the framing in sync. It closes only for a bad preface, a peer closing mid-frame, GOAWAY, an idle timeout, or promised octets it cannot send. The server also survives running out of file descriptors. | `test_thousand_requests_one_connection`, `test_pipelined_requests_answered_in_order`, `test_concurrent_clients` (20 × 10), `test_survives_running_out_of_file_descriptors` |
+| `./bcurl -v localhost:9000/index.html` | `bcurl` takes `HOST:PORT/PATH` (or `bhp://…`) | `demo.sh` |
+| Build the binary request frame | `Client.send_request` | `test_request_bytes_follow_the_spec` |
+| Read the response, body to stdout | The body is streamed to stdout as DATA arrives (never fully buffered), and the client aborts the moment it exceeds `content-length`. The log goes to stderr. | `test_body_to_stdout_exit_zero_and_preface`, `test_body_beyond_content_length_aborts_immediately`, `test_closed_stdout_exits_quietly` |
+| `-v` hexdumps every frame | Preface, every sent and received frame, and unknown frames including their skipped payload. `-vv` also annotates each field. | `test_verbose_hexdumps_every_frame`, `test_verbose_hexdumps_skipped_unknown_payload_too`, `test_vv_annotates_preface_and_fields` |
+| Exit non-zero on 4xx / 5xx | `4` for 4xx, `5` for 5xx, `3` for a protocol or connection error, `2` for usage errors | `test_exit_non_zero_on_4xx_and_5xx`, `test_invalid_status_is_protocol_error`, `test_non_numeric_content_length_is_protocol_error` |
+| And never open a second connection | Several URLs share one socket. `--pipeline` keeps up to 32 requests in flight, so 20,000 pipelined requests cannot deadlock. URLs for different hosts are refused. | `test_never_opens_a_second_connection` (it counts accepts), `test_refuses_urls_that_would_need_two_connections`, `test_pipeline_twenty_thousand_requests_no_deadlock` |
+| Fixed-size frame header; pick the widths and defend them | `Length:24 Type:8 Flags:8 Stream:24`, 8 octets | SPEC §2, DESIGN §2 |
+| HTTP/2 chose 24/8/8/31. Why? | | DESIGN §1, including the draft-13 history: an 8-octet header with a 14-bit length, changed to 24 bits plus `SETTINGS_MAX_FRAME_SIZE` |
+| Number the ten names you send; length-prefix the rest | Static table `0x01`–`0x0A`; literal names are `0x00 name_len:8 name`; values are `value_len:16` | SPEC §5, DESIGN §3, `test_unknown_header_index_and_literal_names_are_accepted` |
+| An unknown frame type MUST be skipped cleanly | All four implementations skip exactly Length octets. `bserve --grease` sends unknown frames to prove clients do this. | `test_unknown_frame_types_are_skipped` (including a 200 KB unknown frame), `test_skips_unknown_frames_and_header_indices`, HEXDUMP §3 |
+| Room for version 2 | Reserved types `0x03`–`0xFF`, reserved header indices `0x0B`–`0xFF`, 7 spare flag bits that must be ignored, and a version byte in the preface (a mismatch gets `505`) | `test_unknown_flag_bits_are_ignored`, `test_wrong_version_is_505_goaway_close` |
 
-frame header, 8 octets:   | Length:24 | Type:8 | Flags:8 | Stream:24 |
-types:                    00 DATA   01 HEADERS   02 GOAWAY   other -> MUST skip
-flags:                    01 END_STREAM
+## Pairs: the spec is the only thing that crosses
 
-header field:             idx:8 [name_len:8 name] value_len:16 value
-static table (idx 1..10): :method :path :status host user-agent accept
-                          content-type content-length server last-modified
-```
+The brief asks for the protocol to work between programs that share nothing
+but the spec. These implementations, in three languages, are all my own work.
+Each was written against `SPEC.md` and they share no code, but they are not a
+substitute for a partner's implementation. If a partner's client or server is
+available, it can be dropped into `interop/matrix.sh` as another row or
+column.
 
-## Track 1: the server
+| | `bserve` (Python) | `interop/bserve.js` (Node) |
+|---|---|---|
+| `bcurl` (Python) | PASS | PASS |
+| `interop/bget.c` (C) | PASS | PASS |
+| `interop/stranger_client.py` (written blind from SPEC.md) | PASS | PASS |
 
-```
-$ ./bserve ./www 9000                  # add -v to log every frame, --grease to
-                                       # send an unknown frame before each response
-```
-
-- It accepts a TCP connection, checks the preface, and reads one request
-  frame at a time.
-- It maps `:path` to a file under the root. A directory maps to its
-  `index.html`, and any path that escapes the root with `..` (including
-  `%2e%2e`) gets `404`.
-- The reply is HEADERS (`:status`, `content-type`, `content-length`, `server`,
-  `last-modified`) followed by DATA frames of at most 16 KiB each.
-- Status codes:
-  - `404` when the file is not there.
-  - `405` for any method other than GET or HEAD.
-  - `400` when the frame is malformed.
-- The connection stays open, including after a `400`: the frame length still
-  says where the next frame starts.
-- It closes only on a bad preface, when the peer closes mid-frame, or after
-  30 s idle (it sends GOAWAY first).
-
-## Track 2: the client
-
-```
-$ ./bcurl -v localhost:9000/index.html
-$ ./bcurl localhost:9000/a localhost:9000/b     # both on ONE connection
-```
-
-- It builds the binary request frame, reads the response, and writes the body
-  to stdout.
-- `-v` hexdumps every frame to stderr. `-vv` also annotates every field.
-- It exits with `4` on a 4xx and `5` on a 5xx, and with `3` on a protocol or
-  connection error.
-- It **never opens a second connection**. Several URLs share one socket (add
-  `--pipeline` to send every request before reading any response). It refuses
-  URLs on different hosts rather than opening a second connection.
-- It skips unknown frame types and unknown header indices.
-
-## Pairing: the "only the spec crosses" test
-
-The assignment wants a server and client that share nothing but the spec.
-There was no partner for this submission, so `interop/bget.c` stands in: a
-second client written in a different language from `SPEC.md` alone, sharing
-no code with `bproto.py`. It talks to `bserve` and skips the server's grease
-frames. The server tests also build their request bytes **by hand** from the
-spec with `struct.pack`, not with the project's own encoder. The client tests
-run `bcurl` against fake servers that send only what the spec allows.
+- **The server test suite runs against both servers.** The 37 server tests
+  in `test_bhp.py` build their bytes by hand from the spec with
+  `struct.pack`, not with this project's encoder. `NodeServerTest` runs the
+  same suite against the Node server, and both pass.
+- **The client tests use fake servers.** They point `bcurl` at fake servers
+  that send only what the spec allows: unknown frames, unknown header
+  indices, `505` on stream 0, and malformed `:status` or `content-length`.
 
 ## Run it
 
 ```
-./bserve ./www 9000 &
-./bcurl -v localhost:9000/index.html
-cc -O2 -o interop/bget interop/bget.c && ./interop/bget localhost 9000 /hi.txt /index.html
-python3 -m unittest -v test_bhp.py
+./bserve ./www 9000                       # -v logs frames, --grease sends unknown frames
+./bcurl -v localhost:9000/index.html      # -vv annotates fields; -I = HEAD; --pipeline
+./bcurl localhost:9000/hi.txt localhost:9000/docs/big.txt   # both on ONE connection
+./interop/matrix.sh                       # every client x every server
+python3 -m unittest -v test_bhp.py        # 109 tests
+python3 tools/render_spec.py SPEC.md SPEC.pdf   # prints "pages: 2"
 ```
+
+It needs Python 3.8+ only. Node and a C compiler are optional, for the
+interop programs.
 
 ## Captured output
 
-All of this is from real runs on macOS with Python 3.14 and Apple clang.
+All output below comes from real runs (macOS, Python 3.14, Node 25, Apple
+clang).
 
-`./bcurl -v localhost:9000/index.html`: 1 preface, 1 request frame, and 2
-response frames:
+<details><summary><code>./demo.sh</code>: 17 passed, 0 failed</summary>
+
+```
+Track 1 -- the server:  ./bserve ./www 9000
+  PASS  accept a TCP connection, read one binary request frame, reply 200   [1 200 open]
+  PASS  map the path to a file under a root; reply status, headers, bytes (48 KB byte-exact)
+  PASS  404 if it is not there -- and the connection stays open   [1 404 2 200 open]
+  PASS  400 if the frame is malformed -- and the connection stays open   [1 400 2 200 open]
+  PASS  paths cannot escape the root (../, %2e%2e)   [1 404 2 404 open]
+  PASS  and keep the connection open: 4 requests, 1 connection   [1 200 2 200 3 200 4 200 open]
+
+Track 2 -- the client:  ./bcurl -v localhost:9000/index.html
+  PASS  build the binary request frame; read the response; body to stdout
+  PASS  -v hexdumps every frame: preface, request, HEADERS, 3 DATA, GOAWAY = 7 dumps
+  PASS  exit non-zero on 4xx  (exit 4)
+  PASS  exit non-zero on 4xx: 405 for DELETE  (exit 4)
+  PASS  and never open a second connection (3 URLs -> 1 connection)
+  PASS  refuses URLs that would need a second connection (exit 2)
+
+The middle -- the protocol
+  PASS  a receiver meeting an unknown frame type MUST skip it cleanly (server)   [1 200 open]
+  PASS  ... and the client skips the server's unknown 0xFA frames too
+  PASS  version byte in the preface: v2 preface gets 505, GOAWAY, close   [0 505 GOAWAY closed]
+  PASS  an HTTP/1.1 client fails fast: 400 on stream 0, GOAWAY, close   [0 400 GOAWAY closed]
+
+Pairs -- the only thing that crosses is the spec
+  PASS  interop matrix: bcurl, bget (C), stranger client  x  bserve, bserve.js (Node) -- 6/6 cells pass
+
+17 passed, 0 failed
+```
+</details>
+
+<details><summary><code>./bcurl -v localhost:9000/index.html</code></summary>
 
 ```
 * connected to localhost:9000 (one TCP connection for everything)
@@ -117,135 +160,45 @@ response frames:
 <   00000060  3a 31 34 20 47 4d 54                              |:14 GMT|
 < DATA stream=1 len=170 flags=END_STREAM
 <   00000000  00 00 aa 00 01 00 00 01  3c 21 64 6f 63 74 79 70  |........<!doctyp|
-    ... (170 body octets) ...
+<   00000010  65 20 68 74 6d 6c 3e 0a  3c 68 74 6d 6c 3e 0a 3c  |e html>.<html>.<|
+    ... (170 body octets, all dumped) ...
 * stream 1: GET /index.html -> 200
 <!doctype html>
-...
+<html>
+<head><title>BHP/1</title></head>
+<body>
+<h1>Hello over BHP/1</h1>
+<p>Served by bserve, fetched by bcurl. Roll No. 24bcs10209.</p>
+</body>
+</html>
 > GOAWAY stream=0 len=4 flags=-
 >   00000000  00 00 04 02 00 00 00 00  64 6f 6e 65              |........done|
 ```
+</details>
 
-Exit codes, a byte-exact 48 KB transfer, pipelining, path traversal, HEAD and
-405:
-
-```
-$ ./bcurl localhost:9000/nope.html; echo "exit=$?"
-not found: /nope.html
-bcurl: /nope.html -> 404
-exit=4
-
-$ ./bcurl localhost:9000/docs/big.txt | shasum;  shasum < www/docs/big.txt
-16e8ce8c7fc5967ba56d62da0572e82c4591665d  -
-16e8ce8c7fc5967ba56d62da0572e82c4591665d  -
-
-$ ./bcurl localhost:9000/docs/hello.txt localhost:9000/ localhost:9000/../../etc/passwd --pipeline --grease; echo "exit=$?"
-hi
-<!doctype html>
-...
-not found: /../../etc/passwd
-bcurl: /../../etc/passwd -> 404
-exit=4
-
-$ ./bcurl -I localhost:9000/docs/big.txt
-:status: 200
-content-type: text/plain; charset=utf-8
-content-length: 48300
-server: bserve/1 (24bcs10209)
-last-modified: Fri, 25 Sep 2026 13:35:14 GMT
-
-$ ./bcurl -X POST localhost:9000/index.html; echo "exit=$?"
-method POST not allowed
-bcurl: /index.html -> 405
-exit=4
-```
-
-Server log for those runs. The pipelined run is a single connection
-(`52483`) carrying streams 1, 2 and 3:
+<details><summary>Interop matrix: <code>./interop/matrix.sh</code></summary>
 
 ```
-bserve (24bcs10209): serving .../02-binary-http/www on :9000 (BHP/1, idle 30s)
-[127.0.0.1:52477] accepted
-[127.0.0.1:52477] stream 1 GET /index.html -> 200 (170 bytes)
-[127.0.0.1:52477] client GOAWAY after 1 requests
-[127.0.0.1:52479] accepted
-[127.0.0.1:52479] stream 1 GET /nope.html -> 404 (22 bytes)
-[127.0.0.1:52479] client GOAWAY after 1 requests
-[127.0.0.1:52481] accepted
-[127.0.0.1:52481] stream 1 GET /docs/big.txt -> 200 (48300 bytes)
-[127.0.0.1:52481] client GOAWAY after 1 requests
-[127.0.0.1:52483] accepted
-[127.0.0.1:52483] stream 1 GET /docs/hello.txt -> 200 (3 bytes)
-[127.0.0.1:52483] stream 2 GET / -> 200 (170 bytes)
-[127.0.0.1:52483] stream 3 GET /../../etc/passwd -> 404 (29 bytes)
-[127.0.0.1:52483] client GOAWAY after 3 requests
-[127.0.0.1:52485] accepted
-[127.0.0.1:52485] stream 1 HEAD /docs/big.txt -> 200 (48300 bytes)
-[127.0.0.1:52485] client GOAWAY after 1 requests
-[127.0.0.1:52487] accepted
-[127.0.0.1:52487] stream 1 -> 405 method POST not allowed
-[127.0.0.1:52487] client GOAWAY after 1 requests
+Interop matrix (each cell: /hi.txt, /docs/big.txt, /missing on one connection)
+  bcurl            -> bserve (Python, --grease) PASS
+  bget (C)         -> bserve (Python, --grease) PASS
+  stranger_client  -> bserve (Python, --grease) PASS
+  bcurl            -> bserve.js (Node)       PASS
+  bget (C)         -> bserve.js (Node)       PASS
+  stranger_client  -> bserve.js (Node)       PASS
+6/6 cells pass
 ```
+</details>
 
-The independent C client, first against a normal server and then against
-`bserve --grease`:
+## Files
 
-```
-$ ./interop/bget localhost 9000 /hi.txt /index.html /missing; echo "exit=$?"
-bget: stream 1 /hi.txt -> 200
-bget: stream 2 /index.html -> 200
-bget: stream 3 /missing -> 404
-hi
-<!doctype html>
-...
-not found: /missing
-exit=4
-
-$ ./interop/bget localhost 9000 /hi.txt      # server started with --grease
-bget: skipped unknown frame type 0xfa (21 octets)
-bget: stream 1 /hi.txt -> 200
-hi
-```
-
-`python3 -m unittest -v test_bhp.py`:
-
-```
-test_body_to_stdout_exit_zero_and_preface ... ok
-test_connection_refused_exits_3 ... ok
-test_exit_non_zero_on_4xx_and_5xx ... ok
-test_never_opens_a_second_connection ... ok
-test_refuses_urls_that_would_need_two_connections ... ok
-test_request_bytes_follow_the_spec ... ok
-test_short_body_is_a_protocol_error ... ok
-test_skips_unknown_frames_and_header_indices ... ok
-test_verbose_hexdumps_every_frame ... ok
-test_bcurl_404_405 ... ok
-test_bcurl_fetches_files_byte_exact ... ok
-test_bcurl_head ... ok
-test_independent_c_client_interoperates ... ok
-test_bad_preface_gets_400_goaway_and_close ... ok
-test_body_split_into_16k_data_frames ... ok
-test_frame_split_across_many_tcp_writes ... ok
-test_headers_on_stream_zero_is_400 ... ok
-test_idle_timeout_sends_goaway ... ok
-test_keeps_connection_open_across_statuses ... ok
-test_malformed_header_block_is_400_and_connection_survives ... ok
-test_path_traversal_is_404 ... ok
-test_pipelined_requests_answered_in_order ... ok
-test_request_body_is_consumed_not_parsed ... ok
-test_spec_worked_example ... ok
-test_unknown_flag_bits_are_ignored ... ok
-test_unknown_frame_types_are_skipped ... ok
-test_unknown_header_index_and_literal_names_are_accepted ... ok
-----------------------------------------------------------------------
-Ran 27 tests in 3.4s
-
-OK
-```
-
-To check the tests can actually fail, I made two deliberate breaks:
-1. `bserve` treats an unknown frame type as an error instead of skipping it.
-2. `bcurl` always exits with `0`.
-
-The first failed `test_unknown_frame_types_are_skipped`. The second failed
-`test_exit_non_zero_on_4xx_and_5xx` and `test_bcurl_404_405`. Restoring the
-code made all 27 pass again.
+| Path | What |
+|---|---|
+| `bserve`, `bcurl`, `bproto.py` | The server, the client, and shared framing and encoding (Python 3 standard library only). |
+| `SPEC.md` / `SPEC.pdf` | The normative spec, two pages. |
+| `DESIGN.md` | The defence of every width, and the HTTP/2 comparison. |
+| `HEXDUMP.md`, `captures/`, `hexdump-capture.txt` | The annotated wire capture, the raw bytes, and `bcurl -vv`'s independent decoding of them. |
+| `interop/` | The C client, the Node server, the blind stranger client, and the matrix script. |
+| `tools/wiretap.py`, `tools/render_spec.py` | The capture relay, and the spec → PDF renderer with page count. |
+| `test_bhp.py`, `demo.sh` | 109 end-to-end tests, and the brief-by-brief demo. |
+| `www/` | The document root used in the examples. |

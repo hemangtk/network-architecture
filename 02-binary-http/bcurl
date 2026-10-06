@@ -20,21 +20,40 @@ Options
     --grease    send an unknown frame type first (server must skip it)
 
 Exit status
-    0  every response was 1xx-3xx
-    4  at least one 4xx (and no 5xx)
+    0  every response was 2xx or 3xx
+    4  at least one 4xx and no 5xx
     5  at least one 5xx
-    3  connection or protocol error
+    3  connection error, protocol error, or stdout closed
     2  usage error
 """
 
+import collections
 import os
 import socket
+import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import bproto as bp  # noqa: E402
 
 USER_AGENT = "bcurl/1 (24bcs10209)"
+MAX_PATH = 60000          # keeps the whole request header block under 64 KiB
+WINDOW = 32               # --pipeline: requests in flight before we read a response
+
+
+class OutputClosed(Exception):
+    """stdout went away (e.g. `| head`); not the server's fault."""
+
+
+def write_out(data):
+    out = sys.stdout
+    if out is None:                     # started with stdout closed (>&-)
+        raise OutputClosed()
+    try:
+        out.buffer.write(data)
+        out.buffer.flush()
+    except (OSError, ValueError):       # EPIPE (| head), EBADF, closed file
+        raise OutputClosed()
 
 
 def err(msg):
@@ -47,11 +66,16 @@ def parse_url(url):
         scheme, url = url.split("://", 1)
         if scheme != "bhp":
             raise ValueError("only bhp:// URLs (or none) are supported")
+    url = url.split("#", 1)[0]          # SPEC 4: a #fragment never goes on the wire
     hostport, slash, path = url.partition("/")
     host, _, port = hostport.rpartition(":")
     if not host or not port.isdigit():
         raise ValueError("expected HOST:PORT/PATH, got %r" % url)
-    return host, int(port), "/" + path
+    path = "/" + path
+    if len(path.encode("utf-8")) > MAX_PATH:
+        raise ValueError("path longer than %d octets cannot fit in one header block"
+                         % MAX_PATH)
+    return host, int(port), path
 
 
 class Client:
@@ -62,6 +86,7 @@ class Client:
         self.sock = socket.create_connection((host, port), timeout=30)
         self.reader = bp.FrameReader(self.sock)
         self.next_stream = 1
+        self.conn_error = False         # got a stream-0 error: connection is over
         self.show("connected to %s:%d (one TCP connection for everything)"
                   % (host, port))
 
@@ -77,8 +102,12 @@ class Client:
               file=sys.stderr)
         print(bp.hexdump(raw, "%s   " % arrow), file=sys.stderr)
         if self.v >= 2:
-            print(bp.format_annotation(bp.annotate(raw), "%s   " % arrow),
-                  file=sys.stderr)
+            try:
+                print(bp.format_annotation(bp.annotate(raw), "%s   " % arrow),
+                      file=sys.stderr)
+            except (IndexError, ValueError, struct.error):
+                print("%s   (payload is malformed; cannot annotate field by field)"
+                      % arrow, file=sys.stderr)
         sys.stderr.flush()
 
     def send_raw(self, raw, arrow=">"):
@@ -88,6 +117,8 @@ class Client:
     def preface(self):
         if self.v:
             print("> PREFACE\n" + bp.hexdump(bp.PREFACE, ">   "), file=sys.stderr)
+        if self.v >= 2:
+            print(bp.format_annotation(bp.annotate_preface(), ">   "), file=sys.stderr)
         self.sock.sendall(bp.PREFACE)
 
     def grease(self):
@@ -106,21 +137,43 @@ class Client:
     def read_frame(self):
         length, ftype, flags, stream, raw = self.reader.read_header()
         if ftype not in (bp.DATA, bp.HEADERS, bp.GOAWAY):
-            self.reader.skip(length)          # the rule you may not skip
-            self.show("unknown frame type 0x%02x (%d octets) skipped"
-                      % (ftype, length))
+            # The rule you may not skip: step over exactly `length` octets.
+            # With -v the skipped bytes are still hexdumped, piece by piece,
+            # so even a 16 MiB unknown frame never sits in memory at once.
             if self.v:
-                print("< " + bp.describe(ftype, flags, stream, length) + "\n"
-                      + bp.hexdump(raw, "<   "), file=sys.stderr)
+                print("< " + bp.describe(ftype, flags, stream, length)
+                      + "  (unknown type: skipped)\n" + bp.hexdump(raw, "<   "),
+                      file=sys.stderr)
+
+                def sink(off, piece):
+                    dump = bp.hexdump(piece, "<   ")
+                    # re-base offsets: payload starts 8 octets into the frame
+                    lines = ["%s%08x%s" % (ln[:4], int(ln[4:12], 16) + 8 + off, ln[12:])
+                             for ln in dump.splitlines()]
+                    print("\n".join(lines), file=sys.stderr)
+                self.reader.skip(length, sink)
+                sys.stderr.flush()
+            else:
+                self.reader.skip(length)
+            self.show("unknown frame type 0x%02x (%d octets) skipped" % (ftype, length))
             return None
-        payload = self.reader.read_exact(length)
+        try:
+            payload = self.reader.read_exact(length)
+        except (bp.ProtocolError, EOFError):
+            if self.v:      # still show the header we did receive
+                print("< %s  (TRUNCATED: connection closed mid-frame)\n%s"
+                      % (bp.describe(ftype, flags, stream, length),
+                         bp.hexdump(raw, "<   ")), file=sys.stderr)
+            raise bp.ProtocolError("connection closed in the middle of a frame")
         self.dump("<", raw + payload)
         return ftype, flags, stream, payload
 
-    def read_response(self, stream):
-        """-> (status, fields, body)"""
-        fields = None
-        body = bytearray()
+    def read_response(self, stream, head):
+        """Read one response; stream the body to stdout as DATA arrives.
+        -> (status, fields). Raises ProtocolError for anything SPEC 5 calls a
+        protocol error (exit 3)."""
+        fields = status = declared = None
+        received = 0
         while True:
             fr = self.read_frame()
             if fr is None:
@@ -130,9 +183,9 @@ class Client:
                 raise bp.ProtocolError("server sent GOAWAY: %s"
                                        % payload.decode("utf-8", "replace"))
             if fstream != stream:
-                if fstream == 0 and ftype == bp.HEADERS:
-                    # connection-level error response (e.g. bad preface)
-                    stream = 0
+                if fstream == 0 and ftype == bp.HEADERS and fields is None:
+                    stream = 0           # SPEC 4: connection-level error response
+                    self.conn_error = True
                 else:
                     raise bp.ProtocolError("frame for stream %d while waiting "
                                            "for stream %d" % (fstream, stream))
@@ -140,16 +193,38 @@ class Client:
                 if fields is not None:
                     raise bp.ProtocolError("second HEADERS on stream %d" % stream)
                 fields = bp.decode_headers(payload)
+                status, declared = check_fields(fields)
             elif fields is None:
                 raise bp.ProtocolError("DATA before HEADERS on stream %d" % stream)
+            elif head:
+                raise bp.ProtocolError("DATA in a response to HEAD")
             else:
-                body += payload
+                received += len(payload)
+                if declared is not None and received > declared:
+                    raise bp.ProtocolError("more than content-length %d octets" % declared)
+                write_out(payload)       # never buffer the whole body
             if flags & bp.END_STREAM:
                 break
-        status = next((v for k, v in fields if k == ":status"), None)
-        if status is None or not status.isdigit():
-            raise bp.ProtocolError("response without a valid :status")
-        return int(status), fields, bytes(body)
+        if not head and declared is not None and received != declared:
+            raise bp.ProtocolError("content-length %d but got %d octets"
+                                   % (declared, received))
+        return status, fields
+
+
+def check_fields(fields):
+    """SPEC 5: exactly one :status of 3 digits 200-599; content-length, if
+    present, exactly once and all digits. -> (status, declared length)"""
+    statuses = [v for k, v in fields if k == ":status"]
+    if (len(statuses) != 1 or len(statuses[0]) != 3 or not statuses[0].isascii()
+            or not statuses[0].isdigit() or not 200 <= int(statuses[0]) <= 599):
+        raise bp.ProtocolError("response needs exactly one :status of 3 digits "
+                               "200-599, got %r" % statuses)
+    lengths = [v for k, v in fields if k == "content-length"]
+    if len(lengths) > 1:
+        raise bp.ProtocolError("content-length appears %d times" % len(lengths))
+    if lengths and not (lengths[0].isascii() and lengths[0].isdigit()):
+        raise bp.ProtocolError("content-length %r is not a number" % lengths[0])
+    return int(statuses[0]), (int(lengths[0]) if lengths else None)
 
 
 def usage(msg=None):
@@ -196,42 +271,52 @@ def main():
               "second connection")
 
     host, port, _ = targets[0]
+    head = method == "HEAD"
     worst = 0
     try:
         c = Client(host, port, verbosity)
         c.preface()
         if grease:
             c.grease()
-        if pipeline:
-            streams = [c.send_request(method, path) for _, _, path in targets]
-        else:
-            streams = [None] * len(targets)
-        for i, (_, _, path) in enumerate(targets):
-            stream = streams[i] or c.send_request(method, path)
-            status, fields, body = c.read_response(stream)
+        # Without --pipeline one request is in flight at a time; with it, up
+        # to WINDOW. A window (not "send everything first") means neither side
+        # can block forever in send() while the other is also sending.
+        window = WINDOW if pipeline else 1
+        inflight = collections.deque()
+        todo = collections.deque(path for _, _, path in targets)
+        while (todo or inflight) and not c.conn_error:
+            while todo and len(inflight) < window:
+                path = todo.popleft()
+                inflight.append((c.send_request(method, path), path))
+            stream, path = inflight.popleft()
+            status, fields = c.read_response(stream, head)
             c.show("stream %d: %s %s -> %d" % (stream, method, path, status))
-            if method == "HEAD":
-                sys.stdout.write(":status: %d\n" % status)
-                for k, v in fields:
-                    if k != ":status":
-                        sys.stdout.write("%s: %s\n" % (k, v))
-                sys.stdout.flush()
-            else:
-                declared = next((v for k, v in fields if k == "content-length"), None)
-                if declared is not None and int(declared) != len(body):
-                    raise bp.ProtocolError("content-length %s but got %d octets"
-                                           % (declared, len(body)))
-                sys.stdout.buffer.write(body)
-                sys.stdout.buffer.flush()
+            if head:
+                write_out(("".join("%s: %s\n" % kv for kv in fields)).encode())
             if status >= 400:
                 err("%s -> %d" % (path, status))
             worst = max(worst, status // 100)
-        c.send_raw(bp.frame(bp.GOAWAY, 0, 0, b"done"))
+            if c.conn_error:
+                # SPEC 4/5: a stream-0 error is the final answer for this
+                # connection; outstanding requests will never be answered.
+                err("server rejected the connection (%d); %d request(s) unanswered"
+                    % (status, len(todo) + len(inflight)))
+                break
+        else:
+            c.send_raw(bp.frame(bp.GOAWAY, 0, 0, b"done"))
         c.sock.close()
+    except OutputClosed:
+        # stdout was closed (`| head`, or `>&-`): stop quietly, no traceback.
+        if sys.stdout is not None:
+            try:
+                os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+            except (OSError, ValueError):
+                pass
+        sys.exit(3)
     except (OSError, EOFError) as e:
         err("connection error: %s" % e)
         sys.exit(3)
-    except bp.ProtocolError as e:
+    except (bp.ProtocolError, ValueError) as e:
         err("protocol error: %s" % e)
         sys.exit(3)
     sys.exit({4: 4, 5: 5}.get(worst, 0))

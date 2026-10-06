@@ -84,11 +84,13 @@ static void send_get(uint32_t stream, const char *path, const char *host) {
     write_full(frame, 8 + n);
 }
 
-/* Find :status (static index 3) in a header block; skip everything else,
- * including indices we do not know (SPEC: MUST skip the field). */
-static int parse_status(const uint8_t *b, size_t len) {
+/* Find :status (index 3) and content-length (index 8) in a header block;
+ * skip everything else, including indices we do not know (SPEC 5: MUST skip
+ * the field). *clen is set to -1 when content-length is absent. */
+static int parse_status(const uint8_t *b, size_t len, long long *clen) {
     size_t i = 0;
     int status = -1;
+    *clen = -1;
     while (i < len) {
         uint8_t idx = b[i++];
         if (idx == 0) {
@@ -99,8 +101,21 @@ static int parse_status(const uint8_t *b, size_t len) {
         size_t vl = ((size_t)b[i] << 8) | b[i + 1];
         i += 2;
         if (i + vl > len) die("value past end of frame");
-        if (idx == 0x03 && vl == 3)
+        if (idx == 0x03) {
+            if (status != -1 || vl != 3) die("need exactly one 3-digit :status");
+            for (size_t k = 0; k < 3; k++)
+                if (b[i + k] < '0' || b[i + k] > '9') die(":status is not digits");
             status = (b[i] - '0') * 100 + (b[i + 1] - '0') * 10 + (b[i + 2] - '0');
+        }
+        if (idx == 0x08) {
+            if (*clen != -1 || vl == 0 || vl > 15) die("bad or repeated content-length");
+            long long v = 0;
+            for (size_t k = 0; k < vl; k++) {
+                if (b[i + k] < '0' || b[i + k] > '9') die("content-length is not digits");
+                v = v * 10 + (b[i + k] - '0');
+            }
+            *clen = v;
+        }
         i += vl;
     }
     return status;
@@ -133,6 +148,7 @@ int main(int argc, char **argv) {
         uint32_t want = (uint32_t)(a - 2);
         send_get(want, argv[a], argv[1]);
         int status = -1, done = 0;
+        long long clen = -1, got = 0;
         while (!done) {
             uint8_t h[8];
             read_full(h, 8);
@@ -144,8 +160,11 @@ int main(int argc, char **argv) {
             read_full(p, len);          /* unknown types: read and drop */
             if (type == 0x02) die("server sent GOAWAY");
             if (type == 0x01 && stream == want) {
-                status = parse_status(p, len);
+                status = parse_status(p, len, &clen);
             } else if (type == 0x00 && stream == want) {
+                if (status == -1) die("DATA before HEADERS");
+                got += len;
+                if (clen >= 0 && got > clen) die("more DATA than content-length");
                 fwrite(p, 1, len, stdout);
             } else if (type <= 0x02) {
                 die("frame for an unexpected stream");
@@ -158,8 +177,9 @@ int main(int argc, char **argv) {
             free(p);
             if ((type == 0x00 || type == 0x01) && (flags & 0x01)) done = 1;
         }
+        if (clen >= 0 && got != clen) die("DATA does not match content-length");
         fprintf(stderr, "bget: stream %u %s -> %d\n", want, argv[a], status);
-        if (status < 100) die("response without :status");
+        if (status < 200 || status > 599) die("response without a valid :status (200-599)");
         if (status / 100 > worst) worst = status / 100;
     }
     uint8_t bye[8];

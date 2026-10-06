@@ -140,6 +140,12 @@ class Peer:
 # ---------------------------------------------------------- server tests --
 
 class ServerTest(unittest.TestCase):
+    """Spec-derived server tests. Run against bserve here and, unchanged,
+    against the independent Node server in NodeServerTest below."""
+
+    @staticmethod
+    def server_cmd(root, port):
+        return [BSERVE, "--idle", "1.5", root, str(port)]
 
     @classmethod
     def setUpClass(cls):
@@ -154,10 +160,16 @@ class ServerTest(unittest.TestCase):
         cls.big = os.urandom(100_000)
         with open(os.path.join(cls.root, "big.bin"), "wb") as f:
             f.write(cls.big)
+        open(os.path.join(cls.root, "empty.txt"), "wb").close()
+        with open(os.path.join(cls.root, "locked.txt"), "wb") as f:
+            f.write(b"no read permission\n")
+        os.chmod(os.path.join(cls.root, "locked.txt"), 0)
+        os.symlink(os.path.join(os.path.dirname(cls.root), "secret.txt"),
+                   os.path.join(cls.root, "escape"))
         with open(os.path.join(os.path.dirname(cls.root), "secret.txt"), "w") as f:
             f.write("outside root")
         cls.port = free_port()
-        cls.proc = subprocess.Popen([BSERVE, "--idle", "1.5", cls.root, str(cls.port)],
+        cls.proc = subprocess.Popen(cls.server_cmd(cls.root, cls.port),
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         wait_for_port(cls.port)
 
@@ -165,6 +177,7 @@ class ServerTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.proc.terminate()
         cls.proc.wait()
+        os.chmod(os.path.join(cls.root, "locked.txt"), 0o644)
         shutil.rmtree(cls.root)
         os.remove(os.path.join(os.path.dirname(cls.root), "secret.txt"))
 
@@ -306,6 +319,264 @@ class ServerTest(unittest.TestCase):
             time.sleep(0.002)
         self.assertEqual(p.response()[2], b"hi\n")
 
+    # -- regressions for review findings -----------------------------------
+
+    def test_unreadable_file_is_403_and_connection_survives(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can read anything")
+        p = self.peer()
+        p.send(get_req("/locked.txt", 1))
+        self.assertEqual(p.response()[1][":status"], "403")
+        p.send(get_req("/hi.txt", 2))
+        self.assertEqual(p.response()[2], b"hi\n")
+
+    def test_symlink_out_of_root_is_404(self):
+        p = self.peer()
+        p.send(get_req("/escape", 1))
+        self.assertEqual(p.response()[1][":status"], "404")
+
+    def test_empty_file_is_headers_only(self):
+        p = self.peer()
+        p.send(get_req("/empty.txt", 1))
+        _, fields, body, sizes = p.response()
+        self.assertEqual((fields[":status"], fields["content-length"], body, sizes),
+                         ("200", "0", b"", []))
+
+    def test_new_headers_before_end_stream_gets_400_then_is_served(self):
+        p = self.peer()
+        p.send(frame(0x01, 0x00, 1, field(1, "GET") + field(2, "/hi.txt"))
+               + frame(0x00, 0x00, 1, b"partial body")
+               + get_req("/index.html", 2))
+        s1, f1, _, _ = p.response()
+        s2, f2, b2, _ = p.response()
+        self.assertEqual((s1, f1[":status"]), (1, "400"))
+        self.assertEqual((s2, f2[":status"], b2), (2, "200", b"<h1>index</h1>\n"))
+
+    def test_goaway_during_request_body_closes_promptly(self):
+        p = self.peer()
+        p.send(frame(0x01, 0x00, 1, field(1, "GET") + field(2, "/hi.txt"))
+               + frame(0x02, 0, 0, b"bye"))
+        p.s.settimeout(1.0)                 # well under the 1.5 s idle timeout
+        self.assertTrue(p.closed())
+
+    def test_wrong_version_is_505_goaway_close(self):
+        p = self.peer(preface=False)
+        p.send(b"BHP\x02" + get_req("/hi.txt", 1))
+        stream, fields, _, _ = p.response()
+        self.assertEqual((stream, fields[":status"]), (0, "505"))
+        self.assertEqual(p.frame()[1], 0x02)
+        self.assertTrue(p.closed())
+
+    def test_oversized_header_block_is_400_and_connection_survives(self):
+        p = self.peer()
+        block = field(1, "GET") + field(2, "/hi.txt") + field(0, "x" * 65000, name="x-big") \
+            + field(0, "y" * 5000, name="x-more")          # 70 KB > 64 KiB limit
+        p.send(frame(0x01, 0x01, 1, block) + get_req("/hi.txt", 2))
+        self.assertEqual(p.response()[1][":status"], "400")
+        self.assertEqual(p.response()[:3:2], (2, b"hi\n"))
+
+    def test_fragment_and_bad_percent_encoding_are_400(self):
+        p = self.peer()
+        for n, path in enumerate(["/hi.txt#frag", "/%ff%fe"], start=1):
+            p.send(get_req(path, n))
+            self.assertEqual(p.response()[1][":status"], "400", path)
+
+    def test_query_is_ignored_and_percent_decoding_applies(self):
+        p = self.peer()
+        p.send(get_req("/hi.txt?x=1&y=2", 1) + get_req("/h%69.txt", 2))
+        self.assertEqual(p.response()[2], b"hi\n")
+        self.assertEqual(p.response()[2], b"hi\n")
+
+    def test_head_on_missing_file_is_404_without_body(self):
+        p = self.peer()
+        p.send(get_req("/nope", 1, "HEAD"))
+        _, fields, body, sizes = p.response()
+        self.assertEqual((fields[":status"], body, sizes), ("404", b"", []))
+        self.assertGreater(int(fields["content-length"]), 0)
+
+    def test_concurrent_clients(self):
+        errors = []
+
+        def worker(k):
+            try:
+                q = Peer(self.port)
+                for n in range(1, 11):
+                    q.send(get_req("/big.bin" if n % 3 == 0 else "/hi.txt", n))
+                    _, f, body, _ = q.response()
+                    want = self.big if n % 3 == 0 else b"hi\n"
+                    if (f[":status"], body) != ("200", want):
+                        errors.append((k, n, f[":status"]))
+                q.close()
+            except Exception as e:              # noqa: BLE001
+                errors.append((k, repr(e)))
+        threads = [threading.Thread(target=worker, args=(k,)) for k in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        self.assertEqual(errors, [])
+
+    def test_thousand_requests_one_connection(self):
+        p = self.peer()
+        for n in range(1, 1001):
+            p.send(get_req("/hi.txt", n))
+            self.assertEqual(p.response()[:3:2], (n, b"hi\n"))
+
+    # -- second review round ------------------------------------------------
+
+    def test_head_error_responses_carry_no_data(self):
+        p = self.peer()
+        for n, path in enumerate(["/%ff", "/hi.txt#frag", "/nope"], start=1):
+            p.send(get_req(path, n, "HEAD"))
+            _, fields, body, sizes = p.response()
+            self.assertIn(fields[":status"], ("400", "404"), path)
+            self.assertEqual((body, sizes), (b"", []), path)
+            self.assertGreater(int(fields["content-length"]), 0)
+        p.send(get_req("hi.txt", 9, "HEAD"))              # no leading slash
+        self.assertEqual(p.response()[2:], (b"", []))
+
+    def test_data_for_another_stream_mid_request_is_400(self):
+        p = self.peer()
+        p.send(frame(0x01, 0x00, 1, field(1, "GET") + field(2, "/hi.txt"))
+               + frame(0x00, 0x01, 9, b"wrong stream") + get_req("/hi.txt", 10))
+        s1, f1, _, _ = p.response()
+        self.assertEqual((s1, f1[":status"]), (1, "400"))
+        self.assertEqual(p.response()[:3:2], (10, b"hi\n"))
+
+    def test_stray_data_with_no_open_request_is_discarded(self):
+        p = self.peer()
+        p.send(frame(0x00, 0x01, 7, b"orphan") + get_req("/hi.txt", 8))
+        self.assertEqual(p.response()[:3:2], (8, b"hi\n"))
+
+    def test_stream_ids_must_increase(self):
+        p = self.peer()
+        p.send(get_req("/hi.txt", 5) + get_req("/hi.txt", 3) + get_req("/hi.txt", 5)
+               + get_req("/hi.txt", 6))
+        got = [(s, f[":status"]) for s, f, _, _ in (p.response() for _ in range(4))]
+        self.assertEqual(got, [(5, "200"), (3, "400"), (5, "400"), (6, "200")])
+
+    def test_file_in_unreadable_directory_is_403(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can read anything")
+        d = os.path.join(self.root, "lockeddir")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "f.txt"), "w") as f:
+            f.write("x")
+        os.chmod(d, 0)
+        self.addCleanup(os.chmod, d, 0o755)
+        p = self.peer()
+        p.send(get_req("/lockeddir/f.txt", 1))
+        self.assertEqual(p.response()[1][":status"], "403")
+
+    def test_root_slash_serves_absolute_paths(self):
+        port = free_port()
+        proc = subprocess.Popen(self.server_cmd("/", port),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.terminate)
+        wait_for_port(port)
+        target = os.path.realpath(os.path.join(self.root, "hi.txt"))
+        p = Peer(port)
+        self.addCleanup(p.close)
+        p.send(get_req(target, 1))
+        self.assertEqual(p.response()[2], b"hi\n")
+
+    # -- third review round -------------------------------------------------
+
+    def test_request_content_length_rules(self):
+        p = self.peer()
+        base = field(1, "GET") + field(2, "/hi.txt")
+        cases = [
+            (frame(0x01, 0x01, 1, base + field(8, "1") + field(8, "1")), "400"),   # repeated
+            (frame(0x01, 0x01, 2, base + field(8, "abc")), "400"),               # not digits
+            (frame(0x01, 0x01, 3, base + field(8, "5")), "400"),                 # promised, no DATA
+            (frame(0x01, 0x00, 4, base + field(8, "3")) + frame(0x00, 0x01, 4, b"abc"), "200"),
+            (frame(0x01, 0x00, 5, base + field(8, "3")) + frame(0x00, 0x01, 5, b"abcde"), "400"),
+        ]
+        for n, (raw, want) in enumerate(cases, start=1):
+            p.send(raw)
+            stream, fields, _, _ = p.response()
+            self.assertEqual((stream, fields[":status"]), (n, want), n)
+
+    def test_400_row_is_checked_before_405(self):
+        p = self.peer()
+        p.send(get_req("/%ff", 1, "POST"))                  # bad path AND bad method
+        self.assertEqual(p.response()[1][":status"], "400")
+
+    def test_aborted_request_still_uses_up_its_stream_id(self):
+        p = self.peer()
+        p.send(frame(0x01, 0x00, 3, field(1, "GET") + field(2, "/hi.txt"))
+               + get_req("/hi.txt", 3))
+        got = [(s, f[":status"]) for s, f, _, _ in (p.response(), p.response())]
+        self.assertEqual(got, [(3, "400"), (3, "400")])     # never two answers for one id
+
+    def test_head_errors_carry_no_data_even_when_aborted_or_reused(self):
+        p = self.peer()
+        p.send(get_req("/hi.txt", 5, "HEAD") + get_req("/hi.txt", 5, "HEAD")      # reused
+               + frame(0x01, 0x00, 6, field(1, "HEAD") + field(2, "/hi.txt"))     # aborted
+               + get_req("/hi.txt", 7, "HEAD"))
+        for want in ("200", "400", "400", "200"):
+            _, fields, body, sizes = p.response()
+            self.assertEqual((fields[":status"], body, sizes), (want, b"", []))
+
+    def test_directory_without_index_is_404(self):
+        os.makedirs(os.path.join(self.root, "noindex"), exist_ok=True)
+        p = self.peer()
+        p.send(get_req("/noindex/", 1) + get_req("/noindex", 2))
+        self.assertEqual([p.response()[1][":status"] for _ in range(2)], ["404", "404"])
+
+
+@unittest.skipUnless(shutil.which("node"), "node not installed")
+class NodeServerTest(ServerTest):
+    """The same spec-derived tests against interop/bserve.js -- an independent
+    server in another language. Passing both is the 'protocol, not an
+    implementation' check from the brief."""
+
+    @staticmethod
+    def server_cmd(root, port):
+        return ["node", os.path.join(HERE, "interop", "bserve.js"), root, str(port), "1.5"]
+
+
+class ServerRobustnessTest(unittest.TestCase):
+    """bserve as a process: startup errors and running out of descriptors."""
+
+    def test_startup_errors_are_clean_messages(self):
+        for args in (["./www", "abc"], ["./nope-dir", "9000"], ["./www", "70000"]):
+            r = subprocess.run([BSERVE, *args], capture_output=True, timeout=10, cwd=HERE)
+            self.assertNotEqual(r.returncode, 0, args)
+            self.assertNotIn(b"Traceback", r.stderr, args)
+        with socket.socket() as busy:
+            busy.bind(("0.0.0.0", 0))
+            busy.listen(1)
+            r = subprocess.run([BSERVE, "./www", str(busy.getsockname()[1])],
+                               capture_output=True, timeout=10, cwd=HERE)
+        self.assertIn(b"cannot listen", r.stderr)
+        self.assertNotIn(b"Traceback", r.stderr)
+
+    def test_survives_running_out_of_file_descriptors(self):
+        port = free_port()
+        proc = subprocess.Popen(["/bin/sh", "-c", 'ulimit -n 24 && exec "$0" ./www "$1"',
+                                 BSERVE, str(port)], cwd=HERE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.terminate)
+        wait_for_port(port)
+        hogs = []
+        for _ in range(40):                      # far more than 24 descriptors
+            try:
+                hogs.append(socket.create_connection(("127.0.0.1", port), timeout=2))
+            except OSError:
+                break
+        time.sleep(0.5)
+        self.assertIsNone(proc.poll(), "bserve exited when out of descriptors")
+        for h in hogs:
+            h.close()
+        time.sleep(0.5)
+        p = Peer(port)
+        self.addCleanup(p.close)
+        p.send(get_req("/hi.txt", 1))
+        self.assertEqual(p.response()[2], b"hi\n")
+
 
 # ---------------------------------------------------------- client tests --
 
@@ -321,6 +592,7 @@ class FakeServer:
         self.port = self.sock.getsockname()[1]
         self.connections = 0
         self.prefaces = []
+        self.close_after_reply = False
         threading.Thread(target=self.loop, daemon=True).start()
 
     def loop(self):
@@ -343,6 +615,8 @@ class FakeServer:
                 _, ftype, _, stream, payload = p.frame()
                 if ftype == 0x01:
                     c.sendall(self.script(stream, payload))
+                    if self.close_after_reply:
+                        break
                 elif ftype == 0x02:
                     break
         except (EOFError, OSError):
@@ -438,6 +712,122 @@ class ClientTest(unittest.TestCase):
                        "flags=END_STREAM", "> GOAWAY"]:
             self.assertIn(needle, err)
 
+    def test_non_numeric_content_length_is_protocol_error(self):
+        srv = self.fake(lambda s, _: frame(0x01, 0, s, field(3, "200") + field(8, "abc"))
+                        + frame(0x00, 0x01, s, b"abc"))
+        r = run_bcurl("localhost:%d/x" % srv.port)
+        self.assertEqual(r.returncode, 3)
+        self.assertNotIn(b"Traceback", r.stderr)
+
+    def test_invalid_status_is_protocol_error(self):
+        for bad in ["2000", "199", "100", "20x", "099", "600", ""]:
+            with self.subTest(status=bad):
+                srv = self.fake(lambda s, _, bad=bad: ok_response(s, b"x", bad))
+                r = run_bcurl("localhost:%d/x" % srv.port)
+                self.assertEqual(r.returncode, 3, r.stderr)
+                self.assertNotIn(b"Traceback", r.stderr)
+
+    def test_verbose_hexdumps_skipped_unknown_payload_too(self):
+        secret = b"SECRET-v2-payload-" * 300            # 5.4 KB, several pieces
+        srv = self.fake(lambda s, _: frame(0xAB, 0, s, secret) + ok_response(s))
+        r = run_bcurl("-v", "localhost:%d/x" % srv.port)
+        self.assertEqual((r.returncode, r.stdout), (0, b"hello\n"))
+        err = r.stderr.decode()
+        self.assertIn("|SECRET-v2-payloa|", err)
+        # last payload line: offset 8 + len - 16 rounded, proves every octet shown
+        self.assertIn("%08x" % (8 + (len(secret) - 1) // 16 * 16), err)
+
+    def test_vv_annotates_preface_and_fields(self):
+        srv = self.fake(lambda s, _: ok_response(s))
+        err = run_bcurl("-vv", "localhost:%d/x" % srv.port).stderr.decode()
+        for needle in ['magic "BHP"', "version = 1", "Type = 0x01 HEADERS",
+                       "field: idx 0x01 = :method", 'value "GET"', 'body "hello\\n"']:
+            self.assertIn(needle, err)
+
+    def test_stream_zero_505_from_server(self):
+        srv = self.fake(lambda s, _: frame(0x01, 0x01, 0, field(3, "505")))
+        r = run_bcurl("localhost:%d/x" % srv.port)
+        self.assertEqual(r.returncode, 5)
+
+    def test_vv_on_malformed_header_block_exits_3_cleanly(self):
+        for tail in (b"\x05\x00", b"\x00"):
+            srv = self.fake(lambda s, _, t=tail: frame(0x01, 0x01, s, field(3, "200") + t))
+            r = run_bcurl("-vv", "localhost:%d/x" % srv.port)
+            self.assertEqual(r.returncode, 3, r.stderr)
+            self.assertNotIn(b"Traceback", r.stderr)
+
+    def test_duplicate_content_length_is_protocol_error(self):
+        srv = self.fake(lambda s, _: frame(0x01, 0, s, field(3, "200") + field(8, "1")
+                                           + field(8, "5")) + frame(0x00, 0x01, s, b"x"))
+        self.assertEqual(run_bcurl("localhost:%d/x" % srv.port).returncode, 3)
+
+    def test_data_on_head_response_is_protocol_error(self):
+        srv = self.fake(lambda s, _: ok_response(s))
+        self.assertEqual(run_bcurl("-I", "localhost:%d/x" % srv.port).returncode, 3)
+
+    def test_body_beyond_content_length_aborts_immediately(self):
+        # server promises 3 octets, then sends 1 MB and keeps the socket open:
+        # bcurl must notice at once, not wait for the connection to close
+        srv = self.fake(lambda s, _: frame(0x01, 0, s, field(3, "200") + field(8, "3"))
+                        + frame(0x00, 0, s, b"z" * 1_000_000))
+        t0 = time.time()
+        r = run_bcurl("localhost:%d/x" % srv.port)
+        self.assertEqual(r.returncode, 3)
+        self.assertLess(time.time() - t0, 5)
+
+    def test_fragment_is_stripped_before_sending(self):
+        seen = []
+        srv = self.fake(lambda s, block: seen.append(req_path(block)) or ok_response(s))
+        self.assertEqual(run_bcurl("localhost:%d/x.txt#section" % srv.port).returncode, 0)
+        self.assertEqual(seen, ["/x.txt"])
+
+    def test_overlong_path_is_usage_error(self):
+        r = run_bcurl("localhost:1/" + "a" * 70000)
+        self.assertEqual(r.returncode, 2)
+
+    def test_closed_stdout_exits_quietly(self):
+        srv = self.fake(lambda s, _: ok_response(s, b"y" * 200_000))
+        r = subprocess.run("%s localhost:%d/x | head -c 10" % (BCURL, srv.port), shell=True,
+                           capture_output=True, timeout=15)
+        self.assertEqual(r.stdout, b"y" * 10)
+        self.assertNotIn(b"Traceback", r.stderr)
+        self.assertNotIn(b"Exception ignored", r.stderr)
+
+    def test_truncated_frame_is_still_dumped_with_v(self):
+        srv = self.fake(lambda s, _: hdr(50, 0x01, 0, s) + b"short")   # then server closes
+        srv.close_after_reply = True
+        r = run_bcurl("-v", "localhost:%d/x" % srv.port)
+        self.assertEqual(r.returncode, 3)
+        self.assertIn(b"TRUNCATED", r.stderr)
+
+    def test_stdout_closed_from_the_start_exits_3_quietly(self):
+        srv = self.fake(lambda s, _: ok_response(s))
+        r = subprocess.run("%s localhost:%d/x >&-" % (BCURL, srv.port), shell=True,
+                           capture_output=True, timeout=15)
+        self.assertEqual(r.returncode, 3)
+        self.assertNotIn(b"Traceback", r.stderr)
+
+    def test_closed_pipe_exit_code_is_3(self):
+        srv = self.fake(lambda s, _: ok_response(s, b"y" * 500_000))
+        r = subprocess.run("%s localhost:%d/x | head -c 1 >/dev/null; echo ${PIPESTATUS[0]}"
+                           % (BCURL, srv.port), shell=True, executable="/bin/bash",
+                           capture_output=True, timeout=15)
+        self.assertEqual(r.stdout.strip(), b"3")
+
+    def test_mixed_4xx_and_5xx_exits_5(self):
+        codes = {"/404": "404", "/503": "503"}
+        srv = self.fake(lambda s, block: ok_response(s, b"x\n", codes[req_path(block)]))
+        r = run_bcurl("localhost:%d/404" % srv.port, "localhost:%d/503" % srv.port)
+        self.assertEqual(r.returncode, 5)
+
+    def test_stream_zero_error_ends_the_run(self):
+        srv = self.fake(lambda s, _: frame(0x01, 0x01, 0, field(3, "400")))
+        r = run_bcurl("localhost:%d/a" % srv.port, "localhost:%d/b" % srv.port,
+                      "localhost:%d/c" % srv.port)
+        self.assertEqual(r.returncode, 4)
+        self.assertIn(b"unanswered", r.stderr)
+        self.assertEqual(srv.connections, 1)
+
     def test_connection_refused_exits_3(self):
         self.assertEqual(run_bcurl("localhost:%d/x" % free_port()).returncode, 3)
 
@@ -474,6 +864,13 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(run_bcurl(self.url("/missing")).returncode, 4)
         self.assertEqual(run_bcurl("-X", "DELETE", self.url("/hi.txt")).returncode, 4)
 
+    def test_pipeline_twenty_thousand_requests_no_deadlock(self):
+        urls = [self.url("/hi.txt")] * 20000      # the old send-everything-first client hung here
+        t0 = time.time()
+        r = subprocess.run([BCURL, "--pipeline", *urls], capture_output=True, timeout=120)
+        self.assertEqual((r.returncode, r.stdout), (0, b"hi\n" * 20000), r.stderr[-300:])
+        self.assertLess(time.time() - t0, 60)
+
     def test_bcurl_head(self):
         r = run_bcurl("-I", self.url("/docs/big.txt"))
         self.assertIn(b"content-length: 48300", r.stdout)
@@ -491,6 +888,23 @@ class EndToEndTest(unittest.TestCase):
         r = subprocess.run([out, "localhost", str(self.port), "/nope"],
                            capture_output=True, timeout=10)
         self.assertEqual(r.returncode, 4)
+
+    def test_stranger_client_written_from_spec_alone(self):
+        r = subprocess.run([sys.executable, os.path.join(HERE, "interop", "stranger_client.py"),
+                            str(self.port), "/hi.txt", "HEAD:/docs/big.txt", "/missing"],
+                           capture_output=True, timeout=10)
+        lines = r.stdout.decode().splitlines()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(lines[0].startswith("1 ") and lines[0].endswith("3 b'hi\\n'"), lines[0])
+        self.assertIn("b'48300'", lines[1])
+        self.assertIn("b'404'", lines[2])
+
+    @unittest.skipUnless(shutil.which("node") and shutil.which("cc"), "needs node and cc")
+    def test_interop_matrix_every_client_every_server(self):
+        r = subprocess.run([os.path.join(HERE, "interop", "matrix.sh")],
+                           capture_output=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout.decode() + r.stderr.decode())
+        self.assertIn(b"6/6 cells pass", r.stdout)
 
 
 if __name__ == "__main__":

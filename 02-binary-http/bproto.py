@@ -21,6 +21,7 @@ HEADER_LEN = 8
 MAX_LENGTH = (1 << 24) - 1          # what 24 bits can express
 MAX_STREAM = (1 << 24) - 1
 DATA_CHUNK = 16384                  # senders split bodies into <= 16 KiB DATA
+MAX_HEADER_BLOCK = 65536            # SPEC: receivers MAY refuse bigger HEADERS
 
 # frame types
 DATA = 0x00
@@ -147,7 +148,7 @@ class FrameReader:
 
     def __init__(self, sock):
         self.sock = sock
-        self.buf = b""
+        self.buf = bytearray()        # amortised O(1) appends, unlike bytes +=
 
     def read_exact(self, n):
         while len(self.buf) < n:
@@ -157,15 +158,21 @@ class FrameReader:
                     raise EOFError("peer closed the connection")
                 raise ProtocolError("peer closed mid-frame")
             self.buf += chunk
-        data, self.buf = self.buf[:n], self.buf[n:]
+        data = bytes(self.buf[:n])
+        del self.buf[:n]
         return data
 
-    def skip(self, n):
+    def skip(self, n, sink=None):
         """Discard n payload bytes in pieces -- a 16 MiB unknown frame costs
-        16 MiB of reading but only 64 KiB of memory."""
+        16 MiB of reading but only 64 KiB of memory. `sink(offset, piece)` is
+        called for each piece (used by bcurl -v to hexdump what it skips)."""
+        off = 0
         while n:
             take = min(n, 65536)
-            self.read_exact(take)
+            piece = self.read_exact(take)
+            if sink:
+                sink(off, piece)
+            off += take
             n -= take
 
     def read_header(self):
@@ -197,6 +204,11 @@ def describe(ftype, flags, stream, length):
         fl.append("0x%02x" % flags)
     return "%s stream=%d len=%d flags=%s" % (name, stream, length,
                                              "|".join(fl) or "-")
+
+
+def annotate_preface(raw=PREFACE):
+    return [(0, "42 48 50", 'magic "BHP" (identifies the protocol)'),
+            (3, "%02x" % raw[3], "version = %d" % raw[3])]
 
 
 def annotate(raw):

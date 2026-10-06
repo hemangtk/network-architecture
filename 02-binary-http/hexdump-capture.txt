@@ -1,6 +1,8 @@
-* connected to localhost:9000 (one TCP connection for everything)
+* connected to localhost:9300 (one TCP connection for everything)
 > PREFACE
 >   00000000  42 48 50 01                                       |BHP.|
+>   0000  42 48 50                                         magic "BHP" (identifies the protocol)
+>   0003  01                                               version = 1
 > HEADERS stream=1 len=57 flags=END_STREAM
 >   00000000  00 00 39 01 01 00 00 01  01 00 03 47 45 54 02 00  |..9........GET..|
 >   00000010  07 2f 68 69 2e 74 78 74  04 00 09 6c 6f 63 61 6c  |./hi.txt...local|
